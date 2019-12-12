@@ -1,0 +1,311 @@
+apiVersion: v1
+kind: Template
+labels:
+  app: httpexporter
+  template: httpexporter-jenkins-pipeline
+metadata:
+  annotations:
+    description: Apache Exporter - Jenkinsfile
+      see https://github.com/Worteks/docker-httpexporter
+    iconClass: icon-openshift
+    openshift.io/display-name: Apache Exporter CI
+    tags: httpexporter
+  name: httpexporter-jenkins-pipeline
+objects:
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    annotations:
+      description: Tests Apache Exporter images
+    name: httpexporter-jenkins-pipeline
+  spec:
+    strategy:
+      jenkinsPipelineStrategy:
+        jenkinsfile: |-
+          def frontName    = 'cixp'
+          def gitCommitMsg = ''
+          def templateMark = 'httpxp-jenkins-ci'
+          def templateSel  = 'jenkins-ci-mark'
+          pipeline {
+              agent {
+                  node { label 'maven' }
+              }
+              options { timeout(time: 95, unit: 'MINUTES') }
+              parameters {
+                  string(defaultValue: 'master', description: 'LemonLDAP-NG Docker Image Tag', name: 'lemonTag')
+                  string(defaultValue: 'secr3t', description: 'OpenLDAP Demo Password', name: 'demoPassword')
+                  string(defaultValue: 'master', description: 'Apache Exporter Docker Image - Source Git Branch', name: 'httpexporterBranch')
+                  string(defaultValue: 'master', description: 'Apache Exporter Docker Image - Source Git Hash', name: 'httpexporterHash')
+                  string(defaultValue: '${GIT_SOURCE_HOST}/Worteks/docker-httpexporter.git', description: 'Apache Exporter Docker Image - Source Git Repository', name: 'httpexporterRepo')
+                  string(defaultValue: '3', description: 'Max Retry', name: 'jobMaxRetry')
+                  string(defaultValue: '1', description: 'Retry Count', name: 'jobRetryCount')
+                  string(defaultValue: 'master', description: 'OpenLDAP Docker Image Tag', name: 'ldapTag')
+                  string(defaultValue: '${OPENSHIFT_ROUTED_DOMAIN}', description: 'CI Router Root Domain', name: 'rootDomain')
+              }
+              stages {
+                  stage('pre-cleanup') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      echo "Using project: ${openshift.project()}"
+                                      echo "cleaning up previous assets for httpexporter-${frontName}-${params.httpexporterHash}"
+                                      openshift.selector("buildconfigs", [ "${templateSel}": "${templateMark}-${params.httpexporterHash}" ]).delete()
+                                      openshift.selector("deploymentconfigs", [ "${templateSel}": "${templateMark}-${params.httpexporterHash}" ]).delete()
+                                      openshift.selector("configmaps", [ "${templateSel}": "${templateMark}-${params.httpexporterHash}" ]).delete()
+                                      openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.httpexporterHash}" ]).delete()
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('create') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      def namespace = "${openshift.project()}"
+                                      try {
+                                          timeout(10) {
+                                              def cloneProto = "http"
+                                              def created
+                                              def objectsFromTemplate
+                                              def privateRepo = false
+                                              def repoHost = params.httpexporterRepo.split('/')[0]
+                                              def templatePath = "/tmp/workspace/${namespace}/${namespace}-httpexporter-jenkins-pipeline/tmphttpexporter${params.httpexporterBranch}/openshift"
+                                              sh "git config --global http.sslVerify false"
+                                              sh "rm -fr tmphttpexporter${params.httpexporterBranch}; mkdir -p tmphttpexporter${params.httpexporterBranch}"
+                                              dir ("tmphttpexporter${params.httpexporterBranch}") {
+                                                  try {
+                                                      withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                          cloneProto = "https"
+                                                          privateRepo = true
+                                                          echo "cloning ${params.httpexporterRepo} over https, using ${repoHost} token"
+                                                          try { git([ branch: "${params.httpexporterBranch}", url: "https://${GIT_TOKEN}@${params.httpexporterRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.httpexporterRepo}#${params.httpexporterBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      }
+                                                  } catch(e) {
+                                                      if (privateRepo != true) {
+                                                          echo "caught ${e} - assuming no credentials required"
+                                                          echo "cloning ${params.httpexporterRepo} over http"
+                                                          try { git([ branch: "${params.httpexporterBranch}", url: "http://${params.httpexporterRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.httpexporterRepo}#${params.httpexporterBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      } else { throw e }
+                                                  }
+                                                  try {
+                                                      gitCommitMsg = sh(returnStdout: true, script: "git log -n 1").trim()
+                                                  } catch(e) { echo "In non-critical catch block resolving commit message - ${e}" }
+                                              }
+                                              try { sh "test -d ${templatePath}" }
+                                              catch (e) {
+                                                  echo "Could not find ./openshift in ${params.httpexporterRepo}#${params.httpexporterBranch}"
+                                                  throw e
+                                              }
+                                              echo "Processing ApacheExporter:${params.httpexporterHash}, from ${repoHost}, tagging to ${params.httpexporterBranch}"
+                                              echo "Testing against LLNG:${params.lemonTag}, OpenLDAP:${params.ldapTag}"
+                                              try {
+                                                  echo " == Creating ImageStream =="
+                                                  objectsFromTemplate = openshift.process("-f", "${templatePath}/imagestream.yaml", '-p', "FRONTNAME=wsweet")
+                                                  echo "The template will create ${objectsFromTemplate.size()} objects"
+                                                  created = openshift.apply(objectsFromTemplate)
+                                                  created.withEach { echo "Created ${it.name()} with labels ${it.object().metadata.labels}" }
+                                              } catch(e) { echo "In non-critical catch block while creating ImageStream - ${e}" }
+                                              try {
+                                                  echo " == Creating BuildConfigs =="
+                                                  if (privateRepo) {
+                                                      withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                          objectsFromTemplate = openshift.process("-f", "${templatePath}/build-with-secret.yaml", '-p', "APACHE_EXPORTER_REPOSITORY_REF=${params.httpexporterHash}",
+                                                              '-p', "APACHE_EXPORTER_REPOSITORY_URL=${cloneProto}://${params.httpexporterRepo}", '-p', "FRONTNAME=wsweet", '-p', "GIT_DEPLOYMENT_TOKEN=${GIT_TOKEN}")
+                                                      }
+                                                  } else {
+                                                      objectsFromTemplate = openshift.process("-f", "${templatePath}/build.yaml", '-p', "APACHE_EXPORTER_REPOSITORY_REF=${params.httpexporterHash}",
+                                                          '-p', "APACHE_EXPORTER_REPOSITORY_URL=${cloneProto}://${params.httpexporterRepo}", '-p', "FRONTNAME=wsweet")
+                                                  }
+                                                  echo "The template will create ${objectsFromTemplate.size()} objects"
+                                                  for (o in objectsFromTemplate) { o.metadata.labels["${templateSel}"] = "${templateMark}-${params.httpexporterHash}" }
+                                                  created = openshift.apply(objectsFromTemplate)
+                                                  created.withEach { echo "Created ${it.name()} from template with labels ${it.object().metadata.labels}" }
+                                              } catch(e) { echo "In non-critical catch block while creating BuildConfigs - ${e}" }
+                                              try {
+                                                  echo " == Creating Secrets =="
+                                                  objectsFromTemplate = openshift.process("-f", "${templatePath}/secret.yaml",
+                                                      '-p', "FRONTNAME=${frontName}-${params.httpexporterHash}", '-p', "OPENLDAP_DEMO_PASSWORD=${params.demoPassword}")
+                                                  echo "The template will create ${objectsFromTemplate.size()} objects"
+                                                  for (o in objectsFromTemplate) { o.metadata.labels["${templateSel}"] = "${templateMark}-${params.httpexporterHash}" }
+                                                  created = openshift.create(objectsFromTemplate)
+                                                  created.withEach { echo "Created ${it.name()} from template with labels ${it.object().metadata.labels}" }
+                                              } catch(e) { echo "In non-critical catch block while creating Secret - ${e}" }
+                                              echo " == Creating Demo =="
+                                              objectsFromTemplate = openshift.process("-f", "${templatePath}/run-ephemeral.yaml", '-p', "APACHE_EXPORTER_IMAGE_TAG=${params.httpexporterHash}",
+                                                  '-p', "FRONTNAME=${frontName}-${params.httpexporterHash}", '-p', "LEMON_IMAGESTREAM_TAG=lemon-wsweet:${params.lemonTag}",
+                                                  '-p', "OPENLDAP_IMAGESTREAM_TAG=openldap-wsweet:${params.ldapTag}", '-p', "WSWEET_BASE_SUFFIX=dc=demo,dc=local",
+                                                  '-p', "WSWEET_ROOT_DOMAIN=${params.httpexporterHash}.${params.rootDomain}")
+                                              echo "The template will create ${objectsFromTemplate.size()} objects"
+                                              for (o in objectsFromTemplate) { o.metadata.labels["${templateSel}"] = "${templateMark}-${params.httpexporterHash}" }
+                                              created = openshift.create(objectsFromTemplate)
+                                              created.withEach { echo "Created ${it.name()} from template with labels ${it.object().metadata.labels}" }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while creating resources - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('build') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(25) {
+                                              echo "watching httpexporter-wsweet-${params.httpexporterHash} docker image build"
+                                              def builds = openshift.selector("bc", [ name: "httpexporter-wsweet-${params.httpexporterHash}" ]).related('builds')
+                                              builds.untilEach(1) { return (it.object().status.phase == "Complete") }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while building Docker image - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('deploy') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(10) {
+                                              retry(2) {
+                                                  echo "watching ldap-${frontName}-${params.httpexporterHash} deployment rollout"
+                                                  def dc = openshift.selector("dc", [ name: "openldap-${frontName}-${params.httpexporterHash}" ]).related('pods')
+                                                  dc.untilEach(1) { return (it.object().status.phase == "Running") }
+                                                  echo "watching httpexporter-${frontName}-${params.httpexporterHash} deployment rollout"
+                                                  dc = openshift.selector("dc", [ name: "lemon-${frontName}-${params.httpexporterHash}" ]).related('pods')
+                                                  dc.untilEach(1) { return (it.object().status.phase == "Running") }
+                                              }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while deploying - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('check') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(5) {
+                                              echo "waiting an additional 2 minutes for applications to finish starting up"
+                                              sleep 120
+                                              def namespace = "${openshift.project()}"
+                                              retry(3) {
+                                                  def response = httpRequest ignoreSslErrors: true, url: "http://lemonexporter-${frontName}-${params.httpexporterHash}.${namespace}.svc:9113", timeout: 30, httpMode: 'GET'
+                                                  println("GET prometheus root status: " + response.status)
+                                                  println("GET prometheus root content: " + response.content)
+                                                  response = httpRequest ignoreSslErrors: true, url: "http://lemonexporter-${frontName}-${params.httpexporterHash}.${namespace}.svc:9113/metrics", timeout: 30, httpMode: 'GET'
+                                                  println("GET prometheus metric status: " + response.status)
+                                                  println("GET prometheus metric content: " + response.content)
+                                              }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while checking Apache Exporter - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('tag') {
+                      steps {
+                          script {
+                              if ("${params.httpexporterBranch}" == "${params.httpexporterHash}") { echo "skipping tag - source matches target" }
+                              else {
+                                  openshift.withCluster() {
+                                      openshift.withProject() {
+                                          try {
+                                              timeout(5) {
+                                                  def namespace = "${openshift.project()}"
+                                                  retry(3) {
+                                                      sh """
+                                                      oc login https://kubernetes.default.svc.cluster.local --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt --token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token) > /dev/null 2>&1
+                                                      oc tag -n ${namespace} httpexporter-wsweet:${params.httpexporterHash} httpexporter-wsweet:${params.httpexporterBranch}
+                                                      """
+                                                  }
+                                              }
+                                          } catch(e) {
+                                              echo "In catch block while tagging Apache Exporter image - ${e}"
+                                              throw e
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              post {
+                  always {
+                      script {
+                          openshift.withCluster() {
+                              openshift.withProject() {
+                                  def namespace   = "${openshift.project()}"
+                                  def postJobName = "${namespace}/${namespace}-post-triggers-jenkins-pipeline"
+                                  currentBuild.description = """
+                                  ${params.httpexporterRepo} ${params.httpexporterBranch} (try ${params.jobRetryCount}/${params.jobMaxRetry})
+                                  ${gitCommitMsg}
+                                  """.stripIndent()
+                                  echo "cleaning up assets for httpexporter-wsweet-${params.httpexporterHash}"
+                                  sh "rm -fr /tmp/workspace/${namespace}/${namespace}-httpexporter-jenkins-pipeline/tmphttpexporter${params.httpexporterBranch}"
+                                  openshift.selector("buildconfigs", [ "${templateSel}": "${templateMark}-${params.httpexporterHash}" ]).delete()
+                                  openshift.selector("deploymentconfigs", [ "${templateSel}": "${templateMark}-${params.httpexporterHash}" ]).delete()
+                                  openshift.selector("configmaps", [ "${templateSel}": "${templateMark}-${params.httpexporterHash}" ]).delete()
+                                  openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.httpexporterHash}" ]).delete()
+                                  def jobParams = [
+                                          [$class: 'StringParameterValue', name: "jobMaxRetry", value: params.jobMaxRetry],
+                                          [$class: 'StringParameterValue', name: "jobRetryCount", value: params.jobRetryCount],
+                                          [$class: 'StringParameterValue', name: "jobStatus", value: currentBuild.currentResult],
+                                          [$class: 'StringParameterValue', name: "sourceBranch", value: params.httpexporterBranch],
+                                          [$class: 'StringParameterValue', name: "sourceComponent", value: "httpexporter"],
+                                          [$class: 'StringParameterValue', name: "sourceRef", value: params.httpexporterHash],
+                                          [$class: 'StringParameterValue', name: "sourceRepo", value: params.httpexporterRepo]
+                                      ]
+                                  try { build job: postJobName, parameters: jobParams, propagate: false, wait: false }
+                                  catch(e) { echo "caught ${e} starting Job post-process" }
+                              }
+                          }
+                      }
+                  }
+                  changed { echo "changed?" }
+                  failure { echo "Build failed (${params.jobRetryCount} out of ${params.jobMaxRetry})" }
+                  success { echo "success!" }
+                  unstable { echo "unstable?" }
+              }
+          }
+      type: JenkinsPipeline
+parameters:
+- name: GIT_SOURCE_HOST
+  description: Git FQDN we would build images from
+  displayName: Git
+  value: git.worteks.com
+- name: OPENSHIFT_ROUTED_DOMAIN
+  description: OpenShift Routers-served Root Domain
+  displayName: CI Router Domain
+  value: ci.dev.wopla.io
